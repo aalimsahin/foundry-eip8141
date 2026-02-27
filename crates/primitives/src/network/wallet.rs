@@ -52,6 +52,10 @@ impl NetworkWallet<FoundryNetwork> for EthereumWallet {
                 let sig = sign_with_wallet(self, sender, &mut tx).await?;
                 Ok(FoundryTxEnvelope::Tempo(tx.into_signed(sig.into())))
             }
+            FoundryTypedTx::Eip8141(tx) => {
+                // EIP-8141 frame txs have no ECDSA signature — seal directly
+                Ok(FoundryTxEnvelope::Eip8141(Sealed::new(tx)))
+            }
         }
     }
 }

@@ -56,7 +56,7 @@ pub fn new_evm_with_inspector<'db, I: InspectorExt>(
         inner: RevmEvm::new_with_inspector(
             ctx,
             inspector,
-            EthInstructions::default(),
+            EthInstructions::new_mainnet_with_spec(spec),
             get_precompiles(spec),
         ),
     };
@@ -75,7 +75,7 @@ pub fn new_evm_with_existing_context<'a>(
         inner: RevmEvm::new_with_inspector(
             ctx,
             inspector,
-            EthInstructions::default(),
+            EthInstructions::new_mainnet_with_spec(spec),
             get_precompiles(spec),
         ),
     };

@@ -108,6 +108,9 @@ impl Signer for DevSigner {
                 unreachable!("op deposit txs should not be signed")
             }
             FoundryTypedTx::Tempo(mut tx) => Ok(signer.sign_transaction_sync(&mut tx)?),
+            FoundryTypedTx::Eip8141(_) => {
+                unreachable!("eip8141 frame txs should not be signed")
+            }
         }
     }
 }
@@ -132,6 +135,7 @@ pub fn build_typed_transaction(
             let tempo_sig: TempoSignature = signature.into();
             FoundryTxEnvelope::Tempo(tx.into_signed(tempo_sig))
         }
+        FoundryTypedTx::Eip8141(tx) => FoundryTxEnvelope::Eip8141(Sealed::new(tx)),
     };
 
     Ok(tx)

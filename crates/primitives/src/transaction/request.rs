@@ -121,6 +121,10 @@ impl FoundryTransactionRequest {
             FoundryTxType::Eip7702 => self.as_ref().complete_7702(),
             FoundryTxType::Deposit => self.complete_deposit(),
             FoundryTxType::Tempo => self.complete_tempo(),
+            FoundryTxType::Eip8141 => {
+                // EIP-8141 frame txs are sent via raw RPC, not built from requests
+                Err(vec!["frames", "sender"])
+            }
         } {
             Err((pref, missing))
         } else {
@@ -289,6 +293,19 @@ impl From<FoundryTypedTx> for FoundryTransactionRequest {
                 inner.transaction_type = Some(TEMPO_TX_TYPE_ID);
                 WithOtherFields { inner, other }.into()
             }
+            FoundryTypedTx::Eip8141(tx) => {
+                use alloy_consensus::Transaction as _;
+                let mut inner = TransactionRequest::default()
+                    .with_chain_id(tx.chain_id)
+                    .with_nonce(tx.nonce)
+                    .with_from(tx.sender)
+                    .with_gas_limit(tx.total_gas_limit())
+                    .with_max_fee_per_gas(tx.max_fee_per_gas)
+                    .with_max_priority_fee_per_gas(tx.max_priority_fee_per_gas)
+                    .with_kind(tx.kind());
+                inner.transaction_type = Some(super::eip8141::EIP8141_TX_TYPE_ID);
+                Self::Ethereum(inner)
+            }
         }
     }
 }
@@ -423,6 +440,7 @@ impl TransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             FoundryTxType::Eip7702 => self.as_ref().complete_7702(),
             FoundryTxType::Deposit => self.complete_deposit(),
             FoundryTxType::Tempo => self.complete_tempo(),
+            FoundryTxType::Eip8141 => Err(vec!["frames", "sender"]),
         }
     }
 
@@ -450,6 +468,7 @@ impl TransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
             FoundryTxType::Eip7702 => self.as_ref().complete_7702().ok(),
             FoundryTxType::Deposit => self.complete_deposit().ok(),
             FoundryTxType::Tempo => self.complete_tempo().ok(),
+            FoundryTxType::Eip8141 => None,
         }?;
         Some(pref)
     }
@@ -461,7 +480,10 @@ impl TransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
         let inner = self.as_mut();
         inner.transaction_type = Some(preferred_type as u8);
         inner.gas.is_none().then(|| inner.set_gas_limit(Default::default()));
-        if !matches!(preferred_type, FoundryTxType::Deposit | FoundryTxType::Tempo) {
+        if !matches!(
+            preferred_type,
+            FoundryTxType::Deposit | FoundryTxType::Tempo | FoundryTxType::Eip8141
+        ) {
             inner.trim_conflicting_keys();
             inner.populate_blob_hashes();
         }
@@ -480,6 +502,7 @@ impl TransactionBuilder<FoundryNetwork> for FoundryTransactionRequest {
                 | FoundryTxType::Eip4844
                 | FoundryTxType::Eip7702
                 | FoundryTxType::Tempo
+                | FoundryTxType::Eip8141
         ) {
             inner
                 .max_priority_fee_per_gas

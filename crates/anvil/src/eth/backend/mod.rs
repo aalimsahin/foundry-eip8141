@@ -2,6 +2,8 @@
 
 /// [revm](foundry_evm::revm) related types
 pub mod db;
+/// EIP-8141 frame transaction execution.
+pub mod eip8141;
 /// In-memory Backend
 pub mod mem;
 

@@ -3380,6 +3380,12 @@ impl EthApi {
             ),
             // TODO(onbjerg): we should impl support for Tempo transactions
             FoundryTypedTx::Tempo(_) => todo!(),
+            // EIP-8141 frame txs don't use ECDSA signatures
+            FoundryTypedTx::Eip8141(_) => Signature::from_scalars_and_parity(
+                B256::with_last_byte(1),
+                B256::with_last_byte(1),
+                false,
+            ),
         }
     }
 
@@ -3452,6 +3458,8 @@ impl EthApi {
             FoundryTxEnvelope::Legacy(_) => Ok(()),
             // TODO(onbjerg): we should impl support for Tempo transactions
             FoundryTxEnvelope::Tempo(_) => todo!(),
+            // EIP-8141 frame transactions are always accepted
+            FoundryTxEnvelope::Eip8141(_) => Ok(()),
         }
     }
 }

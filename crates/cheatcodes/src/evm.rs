@@ -1110,6 +1110,11 @@ impl Cheatcode for executeTransactionCall {
         if matches!(tx, FoundryTxEnvelope::Tempo(_)) {
             return Err(fmt_err!("Tempo transactions are not yet supported by executeTransaction"));
         }
+        if matches!(tx, FoundryTxEnvelope::Eip8141(_)) {
+            return Err(fmt_err!(
+                "EIP-8141 frame transactions are not yet supported by executeTransaction"
+            ));
+        }
 
         // Recover signer from the transaction signature.
         let sender = tx.recover().map_err(|err| fmt_err!("failed to recover signer: {err}"))?;

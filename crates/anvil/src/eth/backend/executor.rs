@@ -4,6 +4,7 @@ use crate::{
         backend::{
             cheats::{CheatEcrecover, CheatsManager},
             db::Db,
+            eip8141::execute_eip8141_frame_tx,
             env::Env,
             mem::op_haltreason_to_instruction_result,
             validate::TransactionValidator,
@@ -98,6 +99,7 @@ impl ExecutedTransaction {
             }
             // TODO(onbjerg): we should impl support for Tempo transactions
             FoundryTxEnvelope::Tempo(_) => todo!(),
+            FoundryTxEnvelope::Eip8141(_) => FoundryReceiptEnvelope::Eip8141(receipt_with_bloom),
         }
     }
 }
@@ -389,7 +391,51 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
             inspector = inspector.with_trace_printer();
         }
 
-        let exec_result = {
+        // Check if this is an EIP-8141 frame transaction — requires separate EVM with
+        // FrameTxContext as chain parameter and EIP-8141 opcodes.
+        let is_eip8141 =
+            matches!(transaction.pending_transaction.transaction.as_ref(), FoundryTxEnvelope::Eip8141(_));
+
+        let exec_result = if is_eip8141 {
+            // Decode the TxEip8141 from the sealed envelope.
+            let frame_tx = match transaction.pending_transaction.transaction.as_ref() {
+                FoundryTxEnvelope::Eip8141(sealed) => sealed.inner().clone(),
+                _ => unreachable!(),
+            };
+
+            trace!(target: "backend", "[{:?}] executing EIP-8141 frame tx", transaction.hash());
+            match execute_eip8141_frame_tx(&mut *self.db, &env, &frame_tx) {
+                Ok(exec_result) => {
+                    // Map HaltReason → OpHaltReason to match EitherEvm's return type.
+                    exec_result.map_haltreason(op_revm::OpHaltReason::Base)
+                }
+                Err(err) => {
+                    warn!(target: "backend", "[{:?}] failed to execute EIP-8141 tx: {:?}", transaction.hash(), err);
+                    match err {
+                        EVMError::Database(err) => {
+                            return Some(TransactionExecutionOutcome::DatabaseError(
+                                transaction,
+                                err,
+                            ));
+                        }
+                        EVMError::Transaction(err) => {
+                            return Some(TransactionExecutionOutcome::Invalid(
+                                transaction,
+                                err.into(),
+                            ));
+                        }
+                        e => {
+                            return Some(TransactionExecutionOutcome::Invalid(
+                                transaction,
+                                InvalidTransactionError::Custom(format!(
+                                    "EIP-8141 execution error: {e}"
+                                )),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
             let mut evm = new_evm_with_inspector(&mut *self.db, &env, &mut inspector);
             self.networks.inject_precompiles(evm.precompiles_mut());
 
@@ -482,6 +528,7 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
         Some(TransactionExecutionOutcome::Executed(tx))
     }
 }
+
 
 /// Inserts all logs into the bloom
 fn build_logs_bloom(logs: &[Log], bloom: &mut Bloom) {

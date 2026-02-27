@@ -18,6 +18,8 @@ use op_revm::OpTransaction;
 use revm::context::TxEnv;
 use tempo_primitives::{AASigned, TempoTransaction};
 
+use super::eip8141::TxEip8141;
+
 //
 /// Container type for signed, typed transactions.
 // NOTE(onbjerg): Boxing `Tempo(AASigned)` breaks `TransactionEnvelope` derive macro trait bounds.
@@ -61,6 +63,14 @@ pub enum FoundryTxEnvelope {
     /// See <https://docs.tempo.xyz/protocol/transactions>.
     #[envelope(ty = 0x76, typed = TempoTransaction)]
     Tempo(AASigned),
+    /// [EIP-8141] Frame Transaction.
+    ///
+    /// A transaction type with composable execution frames and smart-contract
+    /// based authentication (no ECDSA signature).
+    ///
+    /// [EIP-8141]: https://github.com/AlimsahinDev/EIPs/blob/master/EIPS/eip-8141.md
+    #[envelope(ty = 6)]
+    Eip8141(Sealed<TxEip8141>),
 }
 
 impl FoundryTxEnvelope {
@@ -76,6 +86,7 @@ impl FoundryTxEnvelope {
             Self::Eip7702(tx) => Ok(TxEnvelope::Eip7702(tx)),
             Self::Deposit(_) => Err(self),
             Self::Tempo(_) => Err(self),
+            Self::Eip8141(_) => Err(self),
         }
     }
 
@@ -104,6 +115,7 @@ impl FoundryTxEnvelope {
             Self::Eip7702(t) => *t.hash(),
             Self::Deposit(t) => t.tx_hash(),
             Self::Tempo(t) => *t.hash(),
+            Self::Eip8141(t) => t.tx_hash(),
         }
     }
 
@@ -127,6 +139,7 @@ impl FoundryTxEnvelope {
             Self::Eip7702(tx) => tx.recover_signer()?,
             Self::Deposit(tx) => tx.from,
             Self::Tempo(tx) => tx.signature().recover_signer(&tx.signature_hash())?,
+            Self::Eip8141(tx) => tx.sender,
         })
     }
 }
@@ -199,6 +212,28 @@ impl FromRecoveredTx<FoundryTxEnvelope> for TxEnv {
                 Self::from_recovered_tx(sealed_tx.inner(), caller)
             }
             FoundryTxEnvelope::Tempo(_) => panic!("unsupported tx type on ethereum"),
+            FoundryTxEnvelope::Eip8141(sealed_tx) => {
+                // EIP-8141 frame txs are RLP-encoded into TxEnv.data because TxEnv
+                // doesn't natively support frames. Actual execution bypasses this
+                // TxEnv via execute_eip8141_frame_tx() in the executor.
+                use alloy_consensus::Transaction as _;
+                let tx = sealed_tx.inner();
+                let mut rlp_buf = Vec::new();
+                alloy_rlp::Encodable::encode(tx, &mut rlp_buf);
+                TxEnv {
+                    caller,
+                    gas_limit: tx.total_gas_limit(),
+                    gas_price: tx.max_fee_per_gas,
+                    gas_priority_fee: Some(tx.max_priority_fee_per_gas),
+                    tx_type: super::eip8141::EIP8141_TX_TYPE_ID,
+                    data: rlp_buf.into(),
+                    nonce: tx.nonce,
+                    chain_id: Some(tx.chain_id),
+                    value: alloy_primitives::U256::ZERO,
+                    kind: tx.kind(),
+                    ..Default::default()
+                }
+            }
         }
     }
 }
@@ -215,6 +250,11 @@ impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
                 Self::from_recovered_tx(sealed_tx.inner(), caller)
             }
             FoundryTxEnvelope::Tempo(_) => panic!("unsupported tx type on optimism"),
+            FoundryTxEnvelope::Eip8141(_) => {
+                // Wrap the TxEnv conversion in an OpTransaction.
+                let base = <TxEnv as FromRecoveredTx<FoundryTxEnvelope>>::from_recovered_tx(tx, caller);
+                OpTransaction { base, ..Default::default() }
+            }
         }
     }
 }
@@ -229,6 +269,7 @@ impl std::fmt::Display for FoundryTxType {
             Self::Eip7702 => write!(f, "eip7702"),
             Self::Deposit => write!(f, "deposit"),
             Self::Tempo => write!(f, "tempo"),
+            Self::Eip8141 => write!(f, "eip8141"),
         }
     }
 }
@@ -255,6 +296,7 @@ impl From<FoundryTxEnvelope> for FoundryTypedTx {
             FoundryTxEnvelope::Eip7702(signed_tx) => Self::Eip7702(signed_tx.strip_signature()),
             FoundryTxEnvelope::Deposit(sealed_tx) => Self::Deposit(sealed_tx.into_inner()),
             FoundryTxEnvelope::Tempo(signed_tx) => Self::Tempo(signed_tx.strip_signature()),
+            FoundryTxEnvelope::Eip8141(sealed_tx) => Self::Eip8141(sealed_tx.into_inner()),
         }
     }
 }

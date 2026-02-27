@@ -329,6 +329,9 @@ pub enum InvalidTransactionError {
     /// Missing enveloped transaction
     #[error("missing enveloped transaction")]
     MissingEnvelopedTx,
+    /// Custom error message for non-standard transaction types.
+    #[error("{0}")]
+    Custom(String),
 }
 
 impl From<InvalidTransaction> for InvalidTransactionError {

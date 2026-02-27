@@ -499,9 +499,20 @@ rexpect = { git = "https://github.com/rust-cli/rexpect", rev = "2ed0b1898d7edaf6
 # alloy-evm = { git = "https://github.com/alloy-rs/evm.git", branch = "staging-revm" }
 # alloy-op-evm = { git = "https://github.com/alloy-rs/evm.git", branch = "staging-revm" }
 
-## revm
-# revm = { git = "https://github.com/bluealloy/revm.git", rev = "7e59936" }
-# op-revm = { git = "https://github.com/bluealloy/revm.git", rev = "7e59936" }
+## revm — patched to local EIP-8141 fork
+revm = { path = "../revm-eip8141/crates/revm" }
+op-revm = { path = "../revm-eip8141/crates/op-revm" }
+revm-primitives = { path = "../revm-eip8141/crates/primitives" }
+revm-interpreter = { path = "../revm-eip8141/crates/interpreter" }
+revm-precompile = { path = "../revm-eip8141/crates/precompile" }
+revm-database = { path = "../revm-eip8141/crates/database" }
+revm-database-interface = { path = "../revm-eip8141/crates/database/interface" }
+revm-state = { path = "../revm-eip8141/crates/state" }
+revm-bytecode = { path = "../revm-eip8141/crates/bytecode" }
+revm-context = { path = "../revm-eip8141/crates/context" }
+revm-context-interface = { path = "../revm-eip8141/crates/context/interface" }
+revm-handler = { path = "../revm-eip8141/crates/handler" }
+revm-inspector = { path = "../revm-eip8141/crates/inspector" }
 # revm-inspectors = { git = "https://github.com/paradigmxyz/revm-inspectors.git", branch = "staging-revm" }
 
 ## foundry
