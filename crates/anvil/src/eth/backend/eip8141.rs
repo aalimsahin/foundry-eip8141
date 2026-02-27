@@ -33,6 +33,7 @@ use revm::{
     context::{Evm as RevmEvm, Journal, TxEnv},
     context_interface::{
         JournalTr as _,
+        journaled_state::account::JournaledAccountTr as _,
         result::{EVMError, ExecutionResult, Output, SuccessReason},
     },
     handler::instructions::EthInstructions,
@@ -148,26 +149,42 @@ where
     }
 
     // ── Nonce & balance validation ──────────────────────────────────────
-    let sender_account = evm
-        .ctx
-        .journaled_state
-        .load_account(frame_tx.sender)
-        .map_err(EVMError::Database)?;
+    // Read-only validation first.
+    {
+        let sender_account = evm
+            .ctx
+            .journaled_state
+            .load_account(frame_tx.sender)
+            .map_err(EVMError::Database)?;
 
-    if sender_account.info.nonce != frame_tx.nonce {
-        return Ok(ExecutionResult::Revert {
-            gas_used: 0,
-            output: Bytes::from_static(b"EIP-8141: nonce mismatch"),
-        });
+        if sender_account.info.nonce != frame_tx.nonce {
+            return Ok(ExecutionResult::Revert {
+                gas_used: 0,
+                output: Bytes::from_static(b"EIP-8141: nonce mismatch"),
+            });
+        }
+
+        let max_cost =
+            U256::from(frame_tx.max_fee_per_gas) * U256::from(frame_tx.total_gas_limit());
+        if sender_account.info.balance < max_cost {
+            return Ok(ExecutionResult::Revert {
+                gas_used: 0,
+                output: Bytes::from_static(b"EIP-8141: insufficient balance"),
+            });
+        }
     }
 
+    // Increment nonce and deduct max gas cost upfront (P0#1).
     let max_cost =
         U256::from(frame_tx.max_fee_per_gas) * U256::from(frame_tx.total_gas_limit());
-    if sender_account.info.balance < max_cost {
-        return Ok(ExecutionResult::Revert {
-            gas_used: 0,
-            output: Bytes::from_static(b"EIP-8141: insufficient balance"),
-        });
+    {
+        let mut sender_acc = evm
+            .ctx
+            .journaled_state
+            .load_account_mut(frame_tx.sender)
+            .map_err(EVMError::Database)?;
+        sender_acc.set_nonce(frame_tx.nonce + 1);
+        sender_acc.decr_balance(max_cost);
     }
 
     // ── Frame execution ──────────────────────────────────────────────────
@@ -211,34 +228,70 @@ where
         // Set per-frame gas limit so the EVM enforces it.
         evm.ctx.tx.gas_limit = frame_info.gas_limit;
 
-        // Execute frame as system call (bypasses standard tx validation —
-        // we handle nonce/gas/balance ourselves above).
+        // Execute frame. VERIFY frames use checkpoint/revert to be read-only (P1#4).
+        let is_verify = mode == Some(FrameMode::Verify);
+        let checkpoint = if is_verify {
+            Some(evm.ctx.journaled_state.checkpoint())
+        } else {
+            None
+        };
+
         let result = evm.system_call_with_caller_commit(
             caller,
             frame_info.target,
             frame_info.data.clone(),
         );
 
+        // For VERIFY: read approval flag before reverting journal state.
+        // FrameTxContext lives in chain ctx, not the journal, so it survives revert.
+        if let Some(cp) = checkpoint {
+            let approved_after = evm.ctx.chain.sender_approved;
+            evm.ctx.journaled_state.checkpoint_revert(cp);
+            evm.ctx.chain.sender_approved = approved_after;
+        }
+
         match result {
             Ok(exec_result) => {
                 let success = exec_result.is_success();
                 let gas_used = exec_result.gas_used();
+
+                // Per-frame gas limit enforcement (P0#2).
+                if gas_used > frame_info.gas_limit {
+                    total_gas_used = total_gas_used.saturating_add(gas_used);
+                    return Ok(ExecutionResult::Revert {
+                        gas_used: total_gas_used,
+                        output: Bytes::from_static(
+                            b"EIP-8141: frame exceeded gas limit",
+                        ),
+                    });
+                }
+
                 total_gas_used = total_gas_used.saturating_add(gas_used);
                 all_logs.extend(exec_result.into_logs());
 
-                // Check VERIFY frame results: the APPROVE opcode sets
-                // sender_approved in the chain context.
-                if mode == Some(FrameMode::Verify) {
+                // Update frame status in chain context (P1#5).
+                evm.ctx.chain.frames[i].status = Some(success);
+
+                // Check VERIFY frame results (P0#3).
+                if is_verify {
                     if !success {
                         return Ok(ExecutionResult::Revert {
                             gas_used: total_gas_used,
                             output: Bytes::from_static(
-                                b"EIP-8141: VERIFY frame did not APPROVE",
+                                b"EIP-8141: VERIFY frame reverted",
                             ),
                         });
                     }
                     // Read back approval state from the chain context.
                     sender_approved = evm.ctx.chain.sender_approved;
+                    if !sender_approved {
+                        return Ok(ExecutionResult::Revert {
+                            gas_used: total_gas_used,
+                            output: Bytes::from_static(
+                                b"EIP-8141: VERIFY frame did not call APPROVE",
+                            ),
+                        });
+                    }
                 }
             }
             Err(e) => {
@@ -250,6 +303,24 @@ where
                 });
             }
         }
+    }
+
+    // Refund unused gas to the sender (P0#1).
+    let effective_gas_price = {
+        let base_fee = evm.ctx.block.basefee as u128;
+        let tip = (frame_tx.max_fee_per_gas.saturating_sub(base_fee))
+            .min(frame_tx.max_priority_fee_per_gas);
+        base_fee + tip
+    };
+    let actual_cost = U256::from(effective_gas_price) * U256::from(total_gas_used);
+    let refund = max_cost.saturating_sub(actual_cost);
+    if refund > U256::ZERO {
+        let mut sender_acc = evm
+            .ctx
+            .journaled_state
+            .load_account_mut(frame_tx.sender)
+            .map_err(EVMError::Database)?;
+        sender_acc.incr_balance(refund);
     }
 
     Ok(ExecutionResult::Success {

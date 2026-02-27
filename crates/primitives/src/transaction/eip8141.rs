@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_decode_rejects_invalid_frames() {
-        use alloy_eips::eip2718::{Decodable2718, Encodable2718};
+        use alloy_eips::eip2718::Decodable2718;
 
         // Build a tx with no frames, encode it raw (bypassing validation)
         let tx = TxEip8141 {
