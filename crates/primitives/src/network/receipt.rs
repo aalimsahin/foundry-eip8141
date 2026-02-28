@@ -8,7 +8,7 @@ use op_alloy_consensus::{OpDepositReceipt, OpDepositReceiptWithBloom};
 use serde::{Deserialize, Serialize};
 use tempo_primitives::TEMPO_TX_TYPE_ID;
 
-use crate::FoundryReceiptEnvelope;
+use crate::{Eip8141FrameReceipts, Eip8141Receipt, FoundryReceiptEnvelope};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, AsRef)]
 pub struct FoundryTxReceipt(pub WithOtherFields<TransactionReceipt<FoundryReceiptEnvelope<Log>>>);
@@ -137,6 +137,31 @@ impl TryFrom<AnyTransactionReceipt> for FoundryTxReceipt {
                     0x02 => FoundryReceiptEnvelope::Eip1559(receipt_with_bloom),
                     0x03 => FoundryReceiptEnvelope::Eip4844(receipt_with_bloom),
                     0x04 => FoundryReceiptEnvelope::Eip7702(receipt_with_bloom),
+                    0x06 => {
+                        let payer =
+                            other.get_deserialized::<Address>("payer").transpose().ok().flatten();
+                        let frame_receipts = other
+                            .get_deserialized::<Vec<Option<bool>>>("frameReceipts")
+                            .transpose()
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+
+                        FoundryReceiptEnvelope::Eip8141(alloy_consensus::ReceiptWithBloom {
+                            receipt: Eip8141Receipt {
+                                inner: Receipt {
+                                    status: alloy_consensus::Eip658Value::Eip658(
+                                        receipt_with_bloom.status(),
+                                    ),
+                                    cumulative_gas_used: receipt_with_bloom.cumulative_gas_used(),
+                                    logs: receipt_with_bloom.receipt.logs,
+                                },
+                                payer,
+                                frame_receipts: Eip8141FrameReceipts(frame_receipts),
+                            },
+                            logs_bloom: receipt_with_bloom.logs_bloom,
+                        })
+                    }
                     TEMPO_TX_TYPE_ID => FoundryReceiptEnvelope::Tempo(receipt_with_bloom),
                     0x7E => {
                         // Construct the deposit receipt, extracting optional deposit fields

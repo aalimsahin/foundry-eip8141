@@ -3,8 +3,8 @@
 //! Frame transactions (type 0x06) enable composable execution with
 //! multiple frames. Each frame targets a contract with a specific mode:
 //! - **VERIFY** (1): Must call the APPROVE opcode to authorize the sender.
-//! - **DEFAULT** (0): Executes from ENTRY_POINT after approval.
-//! - **SENDER** (2): Executes from tx.sender after approval.
+//! - **DEFAULT** (0): Executes from ENTRY_POINT.
+//! - **SENDER** (2): Executes from tx.sender (requires prior sender approval).
 //!
 //! No ECDSA signature — the sender is explicit in the transaction.
 //!
@@ -16,8 +16,8 @@
 
 use alloy_consensus::Transaction;
 use alloy_eips::eip2718::Typed2718;
-use alloy_primitives::{Address, Bytes, Keccak256, TxKind, B256, U256};
-use alloy_rlp::{BufMut, Decodable, Encodable};
+use alloy_primitives::{Address, B256, Bytes, Keccak256, TxKind, U256};
+use alloy_rlp::{BufMut, Decodable, Encodable, Header};
 use core::mem;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -71,8 +71,8 @@ impl FrameMode {
 pub struct Frame {
     /// Execution mode (0=DEFAULT, 1=VERIFY, 2=SENDER).
     pub mode: u8,
-    /// Target contract address.
-    pub target: Address,
+    /// Optional target contract address. `None` means sender address.
+    pub target: Option<Address>,
     /// Gas limit for this frame.
     pub gas_limit: u64,
     /// Calldata for this frame.
@@ -81,25 +81,30 @@ pub struct Frame {
 
 impl Encodable for Frame {
     fn encode(&self, out: &mut dyn BufMut) {
+        let target_len = self.target.map_or_else(|| Bytes::new().length(), |t| t.length());
         alloy_rlp::Header {
             list: true,
             payload_length: self.mode.length()
-                + self.target.length()
+                + target_len
                 + self.gas_limit.length()
                 + self.data.length(),
         }
         .encode(out);
         self.mode.encode(out);
-        self.target.encode(out);
+        if let Some(target) = self.target {
+            target.encode(out);
+        } else {
+            // Null target is encoded as empty bytes.
+            Bytes::new().encode(out);
+        }
         self.gas_limit.encode(out);
         self.data.encode(out);
     }
 
     fn length(&self) -> usize {
-        let payload_length = self.mode.length()
-            + self.target.length()
-            + self.gas_limit.length()
-            + self.data.length();
+        let target_len = self.target.map_or_else(|| Bytes::new().length(), |t| t.length());
+        let payload_length =
+            self.mode.length() + target_len + self.gas_limit.length() + self.data.length();
         payload_length + alloy_rlp::length_of_length(payload_length)
     }
 }
@@ -112,7 +117,16 @@ impl Decodable for Frame {
         }
         let remaining_before = buf.len();
         let mode = u8::decode(buf)?;
-        let target = Address::decode(buf)?;
+        let target_bytes = Bytes::decode(buf)?;
+        let target = if target_bytes.is_empty() {
+            None
+        } else if target_bytes.len() == 20 {
+            Some(Address::from_slice(target_bytes.as_ref()))
+        } else {
+            return Err(alloy_rlp::Error::Custom(
+                "EIP-8141: frame target must be null or 20-byte address",
+            ));
+        };
         let gas_limit = u64::decode(buf)?;
         let data = Bytes::decode(buf)?;
         let consumed = remaining_before - buf.len();
@@ -159,9 +173,28 @@ pub struct TxEip8141 {
 }
 
 impl TxEip8141 {
+    /// Returns calldata gas cost for `rlp(frames)`.
+    pub fn frames_calldata_cost(&self) -> u64 {
+        const ZERO_BYTE_GAS: u64 = 4;
+        const NON_ZERO_BYTE_GAS: u64 = 16;
+
+        let mut encoded = Vec::new();
+        let frames_payload: usize = self.frames.iter().map(|f| f.length()).sum();
+        Header { list: true, payload_length: frames_payload }.encode(&mut encoded);
+        for frame in &self.frames {
+            frame.encode(&mut encoded);
+        }
+
+        encoded.into_iter().fold(0u64, |acc, b| {
+            acc.saturating_add(if b == 0 { ZERO_BYTE_GAS } else { NON_ZERO_BYTE_GAS })
+        })
+    }
+
     /// Returns the total gas limit (intrinsic + sum of all frame gas limits).
     pub fn total_gas_limit(&self) -> u64 {
-        FRAME_TX_INTRINSIC_COST + self.frames.iter().map(|f| f.gas_limit).sum::<u64>()
+        FRAME_TX_INTRINSIC_COST
+            .saturating_add(self.frames.iter().map(|f| f.gas_limit).sum::<u64>())
+            .saturating_add(self.frames_calldata_cost())
     }
 
     /// Computes the signature hash.
@@ -210,7 +243,6 @@ impl TxEip8141 {
     /// - Frame count <= MAX_FRAMES
     /// - All frame modes are valid (0, 1, or 2)
     /// - Gas limit sum doesn't overflow u64
-    /// - VERIFY frames come before execution frames (DEFAULT/SENDER)
     /// - `max_fee_per_gas >= max_priority_fee_per_gas`
     pub fn validate(&self) -> Result<(), Eip8141ValidationError> {
         if self.frames.is_empty() {
@@ -225,7 +257,6 @@ impl TxEip8141 {
         }
 
         let mut gas_total: u64 = FRAME_TX_INTRINSIC_COST;
-        let mut seen_execution = false;
 
         for (i, frame) in self.frames.iter().enumerate() {
             if FrameMode::from_u8(frame.mode).is_none() {
@@ -235,18 +266,14 @@ impl TxEip8141 {
                 });
             }
 
-            gas_total = gas_total.checked_add(frame.gas_limit).ok_or(
-                Eip8141ValidationError::GasLimitOverflow,
-            )?;
-
-            let is_verify = frame.mode == FrameMode::Verify as u8;
-            if is_verify && seen_execution {
-                return Err(Eip8141ValidationError::VerifyAfterExecution { index: i });
-            }
-            if !is_verify {
-                seen_execution = true;
-            }
+            gas_total = gas_total
+                .checked_add(frame.gas_limit)
+                .ok_or(Eip8141ValidationError::GasLimitOverflow)?;
         }
+
+        let _ = gas_total
+            .checked_add(self.frames_calldata_cost())
+            .ok_or(Eip8141ValidationError::GasLimitOverflow)?;
 
         if self.max_fee_per_gas < self.max_priority_fee_per_gas {
             return Err(Eip8141ValidationError::MaxFeeBelowPriority);
@@ -290,8 +317,6 @@ pub enum Eip8141ValidationError {
     InvalidFrameMode { index: usize, mode: u8 },
     /// Sum of frame gas limits overflows u64.
     GasLimitOverflow,
-    /// A VERIFY frame appears after an execution frame (DEFAULT/SENDER).
-    VerifyAfterExecution { index: usize },
     /// `max_fee_per_gas` is less than `max_priority_fee_per_gas`.
     MaxFeeBelowPriority,
 }
@@ -307,9 +332,6 @@ impl core::fmt::Display for Eip8141ValidationError {
                 write!(f, "EIP-8141: invalid frame mode {mode} at index {index}")
             }
             Self::GasLimitOverflow => write!(f, "EIP-8141: gas limit sum overflows u64"),
-            Self::VerifyAfterExecution { index } => {
-                write!(f, "EIP-8141: VERIFY frame at index {index} after execution frame")
-            }
             Self::MaxFeeBelowPriority => {
                 write!(f, "EIP-8141: max_fee_per_gas < max_priority_fee_per_gas")
             }
@@ -440,11 +462,7 @@ impl Transaction for TxEip8141 {
     }
 
     fn max_fee_per_blob_gas(&self) -> Option<u128> {
-        if self.blob_versioned_hashes.is_empty() {
-            None
-        } else {
-            Some(self.max_fee_per_blob_gas)
-        }
+        if self.blob_versioned_hashes.is_empty() { None } else { Some(self.max_fee_per_blob_gas) }
     }
 
     fn priority_fee_or_price(&self) -> u128 {
@@ -470,7 +488,7 @@ impl Transaction for TxEip8141 {
     fn kind(&self) -> TxKind {
         for frame in &self.frames {
             if frame.mode != FrameMode::Verify as u8 {
-                return TxKind::Call(frame.target);
+                return TxKind::Call(frame.target.unwrap_or(self.sender));
             }
         }
         TxKind::Call(self.sender)
@@ -499,11 +517,7 @@ impl Transaction for TxEip8141 {
     }
 
     fn blob_versioned_hashes(&self) -> Option<&[B256]> {
-        if self.blob_versioned_hashes.is_empty() {
-            None
-        } else {
-            Some(&self.blob_versioned_hashes)
-        }
+        if self.blob_versioned_hashes.is_empty() { None } else { Some(&self.blob_versioned_hashes) }
     }
 
     fn authorization_list(&self) -> Option<&[alloy_eips::eip7702::SignedAuthorization]> {
@@ -551,9 +565,9 @@ impl alloy_eips::eip2718::Decodable2718 for TxEip8141 {
         }
         let tx = Self::decode(data).map_err(alloy_eips::eip2718::Eip2718Error::RlpError)?;
         tx.validate().map_err(|_| {
-            alloy_eips::eip2718::Eip2718Error::RlpError(
-                alloy_rlp::Error::Custom("EIP-8141 validation failed"),
-            )
+            alloy_eips::eip2718::Eip2718Error::RlpError(alloy_rlp::Error::Custom(
+                "EIP-8141 validation failed",
+            ))
         })?;
         Ok(tx)
     }
@@ -575,13 +589,13 @@ mod tests {
             frames: vec![
                 Frame {
                     mode: FrameMode::Verify as u8,
-                    target: Address::ZERO,
+                    target: Some(Address::ZERO),
                     gas_limit: 100_000,
                     data: Bytes::from_static(&[0x01, 0x02, 0x03]),
                 },
                 Frame {
                     mode: FrameMode::Sender as u8,
-                    target: Address::ZERO,
+                    target: Some(Address::ZERO),
                     gas_limit: 200_000,
                     data: Bytes::from_static(&[0xaa, 0xbb]),
                 },
@@ -619,7 +633,8 @@ mod tests {
     #[test]
     fn test_total_gas_limit() {
         let tx = sample_tx();
-        assert_eq!(tx.total_gas_limit(), FRAME_TX_INTRINSIC_COST + 100_000 + 200_000);
+        let expected = FRAME_TX_INTRINSIC_COST + 100_000 + 200_000 + tx.frames_calldata_cost();
+        assert_eq!(tx.total_gas_limit(), expected);
     }
 
     #[test]
@@ -650,17 +665,14 @@ mod tests {
         tx.frames = (0..MAX_FRAMES + 1)
             .map(|_| Frame {
                 mode: FrameMode::Default as u8,
-                target: Address::ZERO,
+                target: Some(Address::ZERO),
                 gas_limit: 1,
                 data: Bytes::new(),
             })
             .collect();
         assert_eq!(
             tx.validate(),
-            Err(Eip8141ValidationError::TooManyFrames {
-                count: MAX_FRAMES + 1,
-                max: MAX_FRAMES,
-            })
+            Err(Eip8141ValidationError::TooManyFrames { count: MAX_FRAMES + 1, max: MAX_FRAMES })
         );
     }
 
@@ -683,22 +695,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_verify_ordering() {
+    fn test_validate_verify_after_execution_allowed() {
         let mut tx = sample_tx();
-        // frames[0] = VERIFY, frames[1] = SENDER — valid order
-        assert!(tx.validate().is_ok());
-
-        // Add VERIFY after SENDER — invalid
         tx.frames.push(Frame {
             mode: FrameMode::Verify as u8,
-            target: Address::ZERO,
+            target: Some(Address::ZERO),
             gas_limit: 100,
             data: Bytes::new(),
         });
-        assert_eq!(
-            tx.validate(),
-            Err(Eip8141ValidationError::VerifyAfterExecution { index: 2 })
-        );
+        assert!(tx.validate().is_ok());
     }
 
     #[test]
@@ -765,5 +770,19 @@ mod tests {
 
         // Decoding should fail validation
         assert!(TxEip8141::decode_2718(&mut buf.as_slice()).is_err());
+    }
+
+    #[test]
+    fn test_null_target_roundtrip() {
+        let mut tx = sample_tx();
+        tx.frames[0].target = None;
+        tx.frames[1].target = None;
+
+        let mut buf = Vec::new();
+        tx.encode(&mut buf);
+        let decoded = TxEip8141::decode(&mut buf.as_slice()).unwrap();
+        assert_eq!(decoded.frames[0].target, None);
+        assert_eq!(decoded.frames[1].target, None);
+        assert_eq!(decoded, tx);
     }
 }

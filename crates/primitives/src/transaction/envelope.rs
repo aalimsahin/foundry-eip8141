@@ -252,7 +252,8 @@ impl FromRecoveredTx<FoundryTxEnvelope> for OpTransaction<TxEnv> {
             FoundryTxEnvelope::Tempo(_) => panic!("unsupported tx type on optimism"),
             FoundryTxEnvelope::Eip8141(_) => {
                 // Wrap the TxEnv conversion in an OpTransaction.
-                let base = <TxEnv as FromRecoveredTx<FoundryTxEnvelope>>::from_recovered_tx(tx, caller);
+                let base =
+                    <TxEnv as FromRecoveredTx<FoundryTxEnvelope>>::from_recovered_tx(tx, caller);
                 OpTransaction { base, ..Default::default() }
             }
         }

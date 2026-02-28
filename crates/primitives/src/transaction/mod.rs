@@ -8,5 +8,7 @@ pub use eip8141::{
     FrameMode, MAX_FRAMES, TxEip8141,
 };
 pub use envelope::{FoundryTxEnvelope, FoundryTxType, FoundryTypedTx};
-pub use receipt::FoundryReceiptEnvelope;
+pub use receipt::{
+    Eip8141FrameReceipts, Eip8141Receipt, Eip8141ReceiptWithBloom, FoundryReceiptEnvelope,
+};
 pub use request::{FoundryTransactionRequest, get_deposit_tx_parts};

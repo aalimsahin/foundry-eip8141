@@ -221,4 +221,8 @@ pub struct TransactionInfo {
     pub out: Option<Bytes>,
     pub nonce: u64,
     pub gas_used: u64,
+    /// EIP-8141 payer address captured at execution time.
+    pub eip8141_payer: Option<Address>,
+    /// EIP-8141 per-frame execution statuses.
+    pub eip8141_frame_statuses: Option<Vec<Option<bool>>>,
 }

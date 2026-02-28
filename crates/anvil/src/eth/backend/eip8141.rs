@@ -3,8 +3,8 @@
 //! Frame transactions (type 0x06) enable composable execution with
 //! multiple frames. Each frame targets a contract with a specific mode:
 //! - **VERIFY** (1): Must call APPROVE opcode to authorize the sender.
-//! - **DEFAULT** (0): Executes from ENTRY_POINT after approval.
-//! - **SENDER** (2): Executes from tx.sender after approval.
+//! - **DEFAULT** (0): Executes from ENTRY_POINT.
+//! - **SENDER** (2): Executes from tx.sender after sender approval.
 //!
 //! No ECDSA signature — sender is explicit in the transaction.
 //!
@@ -12,11 +12,12 @@
 //!
 //! 1. Build a `FrameTxContext` from the transaction fields.
 //! 2. Construct a separate `RevmEvm` with EIP-8141 opcodes enabled.
-//! 3. Validate nonce and balance of the sender account.
+//! 3. Validate nonce of the sender account.
 //! 4. Iterate through frames in order:
-//!    - VERIFY frames run first; they must call the APPROVE opcode.
-//!    - Once approved, DEFAULT/SENDER frames execute with the appropriate caller.
-//! 5. Refund unused gas to the sender after all frames complete.
+//!    - VERIFY frames must call the APPROVE opcode.
+//!    - DEFAULT frames are always allowed.
+//!    - SENDER frames require `sender_approved == true`.
+//! 5. Charge the approved payer for actual gas and bump sender nonce.
 //!
 //! We use `Handler::execution()` directly for each frame — it runs the frame
 //! and returns `FrameResult` WITHOUT calling `commit_tx()` or `finalize()`.
@@ -24,30 +25,40 @@
 //! and we control when to commit via a single `finalize()` + `commit()` at the end.
 
 use super::env::Env;
-use alloy_primitives::{Bytes, Log, U256};
+use alloy_evm::precompiles::PrecompilesMap;
+use alloy_primitives::{Address, Bytes, Log, U256};
 use foundry_evm::backend::DatabaseError;
-use foundry_primitives::{
-    FrameMode, TxEip8141, ENTRY_POINT, FRAME_TX_INTRINSIC_COST,
-};
+use foundry_primitives::{ENTRY_POINT, FRAME_TX_INTRINSIC_COST, FrameMode, TxEip8141};
 use revm::{
     Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
     context::{Evm as RevmEvm, Journal, TxEnv},
     context_interface::{
-        JournalTr as _,
-        LocalContextTr as _,
+        JournalTr as _, LocalContextTr as _,
         journaled_state::account::JournaledAccountTr as _,
         result::{EVMError, ExecutionResult, Output, SuccessReason},
     },
-    handler::{
-        Handler as _, MainnetHandler,
-        instructions::EthInstructions,
-    },
-    interpreter::{instructions::frame_tx::FrameTxContext, interpreter::EthInterpreter},
+    handler::{Handler as _, MainnetHandler, instructions::EthInstructions},
     interpreter::InitialAndFloorGas,
+    interpreter::{instructions::frame_tx::FrameTxContext, interpreter::EthInterpreter},
     precompile::{PrecompileSpecId, Precompiles},
 };
-use alloy_evm::precompiles::PrecompilesMap;
 use std::fmt::Debug;
+
+/// EIP-8141 execution metadata exported for receipt enrichment.
+#[derive(Clone, Debug, Default)]
+pub struct Eip8141ExecutionMeta {
+    /// Selected payer if payment approval succeeded.
+    pub payer: Option<Address>,
+    /// Per-frame status (None=not executed, Some(true)=success, Some(false)=failure).
+    pub frame_statuses: Vec<Option<bool>>,
+}
+
+/// EIP-8141 execution result and metadata.
+#[derive(Clone, Debug)]
+pub struct Eip8141ExecutionOutcome {
+    pub result: ExecutionResult,
+    pub meta: Eip8141ExecutionMeta,
+}
 
 /// Builds a [`FrameTxContext`] from a [`TxEip8141`].
 ///
@@ -81,7 +92,8 @@ fn build_frame_tx_context(tx: &TxEip8141) -> FrameTxContext {
             .iter()
             .map(|f| FrameInfo {
                 mode: f.mode,
-                target: f.target,
+                // EIP-8141 null target means sender address.
+                target: f.target.unwrap_or(tx.sender),
                 gas_limit: f.gas_limit,
                 data: f.data.clone(),
                 status: None,
@@ -100,7 +112,7 @@ pub fn execute_eip8141_frame_tx<DB>(
     db: DB,
     env: &Env,
     frame_tx: &TxEip8141,
-) -> Result<ExecutionResult, EVMError<DatabaseError>>
+) -> Result<Eip8141ExecutionOutcome, EVMError<DatabaseError>>
 where
     DB: Database<Error = DatabaseError> + DatabaseCommit + Debug,
 {
@@ -148,49 +160,30 @@ where
     > = RevmEvm::new(ctx, instructions, precompiles);
 
     if frame_ctx.frames.is_empty() {
-        return Ok(ExecutionResult::Revert {
-            gas_used: 0,
-            output: Bytes::from_static(b"EIP-8141: no frames"),
+        return Ok(Eip8141ExecutionOutcome {
+            result: ExecutionResult::Revert {
+                gas_used: 0,
+                output: Bytes::from_static(b"EIP-8141: no frames"),
+            },
+            meta: Eip8141ExecutionMeta::default(),
         });
     }
 
     // ── Nonce & balance validation ──────────────────────────────────────
     // Read-only validation first.
     {
-        let sender_account = evm
-            .ctx
-            .journaled_state
-            .load_account(frame_tx.sender)
-            .map_err(EVMError::Database)?;
+        let sender_account =
+            evm.ctx.journaled_state.load_account(frame_tx.sender).map_err(EVMError::Database)?;
 
         if sender_account.info.nonce != frame_tx.nonce {
-            return Ok(ExecutionResult::Revert {
-                gas_used: 0,
-                output: Bytes::from_static(b"EIP-8141: nonce mismatch"),
+            return Ok(Eip8141ExecutionOutcome {
+                result: ExecutionResult::Revert {
+                    gas_used: 0,
+                    output: Bytes::from_static(b"EIP-8141: nonce mismatch"),
+                },
+                meta: Eip8141ExecutionMeta::default(),
             });
         }
-
-        let max_cost =
-            U256::from(frame_tx.max_fee_per_gas) * U256::from(frame_tx.total_gas_limit());
-        if sender_account.info.balance < max_cost {
-            return Ok(ExecutionResult::Revert {
-                gas_used: 0,
-                output: Bytes::from_static(b"EIP-8141: insufficient balance"),
-            });
-        }
-    }
-
-    // Increment nonce and deduct max gas cost upfront (P0#1).
-    let max_cost =
-        U256::from(frame_tx.max_fee_per_gas) * U256::from(frame_tx.total_gas_limit());
-    {
-        let mut sender_acc = evm
-            .ctx
-            .journaled_state
-            .load_account_mut(frame_tx.sender)
-            .map_err(EVMError::Database)?;
-        sender_acc.set_nonce(frame_tx.nonce + 1);
-        sender_acc.decr_balance(max_cost);
     }
 
     // ── Frame execution ──────────────────────────────────────────────────
@@ -201,7 +194,10 @@ where
     let mut failure: Option<Bytes> = None;
     let mut all_logs: Vec<Log> = Vec::new();
     let mut total_gas_used: u64 = FRAME_TX_INTRINSIC_COST;
+    let mut total_gas_spent: u64 = FRAME_TX_INTRINSIC_COST;
     let mut sender_approved = false;
+    let has_sender_frames =
+        frame_ctx.frames.iter().any(|frame| frame.mode == FrameMode::Sender as u8);
 
     'frames: for (i, frame_info) in frame_ctx.frames.iter().enumerate() {
         let mode = FrameMode::from_u8(frame_info.mode);
@@ -209,14 +205,15 @@ where
         // Update current frame index in the context.
         evm.ctx.chain.current_frame_index = i;
 
-        // Pre-frame checks: SENDER and DEFAULT frames require prior approval.
+        // Pre-frame checks: only SENDER frames require prior sender approval.
         match mode {
-            Some(FrameMode::Default) | Some(FrameMode::Sender) => {
+            Some(FrameMode::Sender) => {
                 if !sender_approved {
                     failure = Some(Bytes::from_static(b"EIP-8141: sender not approved"));
                     break 'frames;
                 }
             }
+            Some(FrameMode::Default) => {}
             Some(FrameMode::Verify) => {}
             None => {
                 failure = Some(Bytes::from_static(b"EIP-8141: invalid frame mode"));
@@ -231,13 +228,12 @@ where
         };
 
         let is_verify = mode == Some(FrameMode::Verify);
+        let sender_approved_before = evm.ctx.chain.sender_approved;
+        let payer_approved_before = evm.ctx.chain.payer_approved;
+        let payer_before = evm.ctx.chain.payer;
 
         // For VERIFY: take a checkpoint so we can revert state changes.
-        let verify_cp = if is_verify {
-            Some(evm.ctx.journaled_state.checkpoint())
-        } else {
-            None
-        };
+        let verify_cp = if is_verify { Some(evm.ctx.journaled_state.checkpoint()) } else { None };
 
         // Set TxEnv for this frame.
         evm.ctx.tx = TxEnv::builder()
@@ -272,10 +268,12 @@ where
         // Extract gas info from FrameResult.
         // used() = spent() - min(refunded, spent/5) to honor EVM-level gas refunds.
         let gas_used = frame_result.gas().used();
+        let gas_spent = frame_result.gas().spent();
         let success = frame_result.instruction_result().is_ok();
 
         // Always add gas_used BEFORE any break (ensures failure path charges correctly).
         total_gas_used = total_gas_used.saturating_add(gas_used);
+        total_gas_spent = total_gas_spent.saturating_add(gas_spent);
 
         // Update frame status in chain context.
         evm.ctx.chain.frames[i].status = Some(success);
@@ -303,36 +301,50 @@ where
             // Do NOT collect logs (reverted by checkpoint_revert — log_i truncation).
             if !success {
                 failure = Some(Bytes::from_static(b"EIP-8141: VERIFY frame reverted"));
+                evm.ctx.journaled_state.transient_storage.clear();
+                break 'frames;
+            }
+            let approval_changed = evm.ctx.chain.sender_approved != sender_approved_before
+                || evm.ctx.chain.payer_approved != payer_approved_before
+                || evm.ctx.chain.payer != payer_before;
+            if !approval_changed {
+                failure = Some(Bytes::from_static(b"EIP-8141: VERIFY frame did not call APPROVE"));
+                evm.ctx.journaled_state.transient_storage.clear();
                 break 'frames;
             }
             sender_approved = evm.ctx.chain.sender_approved;
-            if !sender_approved {
-                failure = Some(Bytes::from_static(
-                    b"EIP-8141: VERIFY frame did not call APPROVE",
-                ));
-                break 'frames;
-            }
+            // EIP-8141 clears transient storage between top-level frames.
+            evm.ctx.journaled_state.transient_storage.clear();
         } else {
             // DEFAULT/SENDER — state stays in journal.
             if !success {
                 failure = Some(Bytes::from_static(b"EIP-8141: frame execution failed"));
+                evm.ctx.journaled_state.transient_storage.clear();
                 break 'frames;
             }
             // Collect logs (take_logs drains journal logs accumulated during this frame).
             all_logs.extend(evm.ctx.journaled_state.take_logs());
+            // EIP-8141 clears transient storage between top-level frames.
+            evm.ctx.journaled_state.transient_storage.clear();
         }
     }
 
-    // ── Single exit block ────────────────────────────────────────────────
-    if failure.is_some() {
-        // Revert all frame state changes (preserves nonce + balance before checkpoint).
-        evm.ctx.journaled_state.checkpoint_revert(accounting_checkpoint);
+    // Payment approval is required by EIP-8141 semantics.
+    if failure.is_none() && !evm.ctx.chain.payer_approved {
+        failure = Some(Bytes::from_static(b"EIP-8141: payer not approved"));
         all_logs.clear();
-    } else {
-        evm.ctx.journaled_state.checkpoint_commit();
     }
 
-    // Gas refund — SAME formula for success and failure.
+    // Keep local sender_approved in sync for clarity in debug traces.
+    if failure.is_none() && has_sender_frames {
+        sender_approved = evm.ctx.chain.sender_approved;
+        if !sender_approved {
+            failure = Some(Bytes::from_static(b"EIP-8141: sender not approved"));
+            all_logs.clear();
+        }
+    }
+
+    // Compute transaction cost from actual gas usage.
     let effective_gas_price = {
         let base_fee = evm.ctx.block.basefee as u128;
         let tip = (frame_tx.max_fee_per_gas.saturating_sub(base_fee))
@@ -340,31 +352,64 @@ where
         base_fee + tip
     };
     let actual_cost = U256::from(effective_gas_price) * U256::from(total_gas_used);
-    let refund = max_cost.saturating_sub(actual_cost);
-    if refund > U256::ZERO {
-        let mut sender_acc = evm
-            .ctx
-            .journaled_state
-            .load_account_mut(frame_tx.sender)
-            .map_err(EVMError::Database)?;
-        sender_acc.incr_balance(refund);
+
+    let payer = evm.ctx.chain.payer;
+    let mut can_charge_payer = false;
+    if evm.ctx.chain.payer_approved {
+        let payer_acc = evm.ctx.journaled_state.load_account(payer).map_err(EVMError::Database)?;
+        if payer_acc.info.balance < actual_cost {
+            failure = Some(Bytes::from_static(b"EIP-8141: insufficient payer balance"));
+            all_logs.clear();
+        } else {
+            can_charge_payer = true;
+        }
+    }
+
+    // ── Single exit block ────────────────────────────────────────────────
+    if failure.is_some() {
+        evm.ctx.journaled_state.checkpoint_revert(accounting_checkpoint);
+        all_logs.clear();
+    } else {
+        evm.ctx.journaled_state.checkpoint_commit();
+    }
+
+    // Charge payer for actual gas and bump sender nonce.
+    // This is applied for both success and revert outcomes if payment was approved.
+    if can_charge_payer {
+        {
+            let mut payer_acc =
+                evm.ctx.journaled_state.load_account_mut(payer).map_err(EVMError::Database)?;
+            payer_acc.decr_balance(actual_cost);
+        }
+        {
+            let mut sender_acc = evm
+                .ctx
+                .journaled_state
+                .load_account_mut(frame_tx.sender)
+                .map_err(EVMError::Database)?;
+            sender_acc.set_nonce(frame_tx.nonce + 1);
+        }
     }
 
     // Single atomic commit to DB.
     let state = evm.finalize();
     evm.commit(state);
 
-    match failure {
-        Some(output) => Ok(ExecutionResult::Revert {
-            gas_used: total_gas_used,
-            output,
-        }),
-        None => Ok(ExecutionResult::Success {
+    let meta = Eip8141ExecutionMeta {
+        payer: evm.ctx.chain.payer_approved.then_some(evm.ctx.chain.payer),
+        frame_statuses: evm.ctx.chain.frames.iter().map(|f| f.status).collect(),
+    };
+
+    let result = match failure {
+        Some(output) => ExecutionResult::Revert { gas_used: total_gas_used, output },
+        None => ExecutionResult::Success {
             reason: SuccessReason::Return,
             gas_used: total_gas_used,
-            gas_refunded: 0,
+            gas_refunded: total_gas_spent.saturating_sub(total_gas_used),
             logs: all_logs,
             output: Output::Call(Bytes::new()),
-        }),
-    }
+        },
+    };
+
+    Ok(Eip8141ExecutionOutcome { result, meta })
 }

@@ -30,7 +30,7 @@ use alloy_evm::{
     precompiles::{DynPrecompile, Precompile, PrecompilesMap},
 };
 use alloy_op_evm::OpEvmFactory;
-use alloy_primitives::{B256, Bloom, BloomInput, Log};
+use alloy_primitives::{Address, B256, Bloom, BloomInput, Log};
 use anvil_core::eth::{
     block::{BlockInfo, create_block},
     transaction::{PendingTransaction, TransactionInfo},
@@ -41,7 +41,9 @@ use foundry_evm::{
     traces::{CallTraceDecoder, CallTraceNode},
 };
 use foundry_evm_networks::NetworkConfigs;
-use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope};
+use foundry_primitives::{
+    Eip8141FrameReceipts, Eip8141Receipt, FoundryReceiptEnvelope, FoundryTxEnvelope,
+};
 use op_revm::{OpContext, OpTransaction};
 use revm::{
     Database, Inspector,
@@ -62,6 +64,8 @@ pub struct ExecutedTransaction {
     logs: Vec<Log>,
     traces: Vec<CallTraceNode>,
     nonce: u64,
+    eip8141_payer: Option<Address>,
+    eip8141_frame_statuses: Option<Vec<Option<bool>>>,
 }
 
 // == impl ExecutedTransaction ==
@@ -99,7 +103,17 @@ impl ExecutedTransaction {
             }
             // TODO(onbjerg): we should impl support for Tempo transactions
             FoundryTxEnvelope::Tempo(_) => todo!(),
-            FoundryTxEnvelope::Eip8141(_) => FoundryReceiptEnvelope::Eip8141(receipt_with_bloom),
+            FoundryTxEnvelope::Eip8141(_) => {
+                let frame_receipts = self.eip8141_frame_statuses.clone().unwrap_or_default();
+                FoundryReceiptEnvelope::Eip8141(ReceiptWithBloom {
+                    receipt: Eip8141Receipt {
+                        inner: receipt_with_bloom.receipt,
+                        payer: self.eip8141_payer,
+                        frame_receipts: Eip8141FrameReceipts(frame_receipts),
+                    },
+                    logs_bloom: receipt_with_bloom.logs_bloom,
+                })
+            }
         }
     }
 }
@@ -210,14 +224,24 @@ impl<DB: Db + ?Sized, V: TransactionValidator> TransactionExecutor<'_, DB, V> {
             }
             let receipt = tx.create_receipt(&mut cumulative_gas_used);
 
-            let ExecutedTransaction { transaction, logs, out, traces, exit_reason: exit, .. } = tx;
+            let ExecutedTransaction {
+                transaction,
+                logs,
+                out,
+                traces,
+                exit_reason: exit,
+                nonce,
+                gas_used,
+                eip8141_payer,
+                eip8141_frame_statuses,
+            } = tx;
             build_logs_bloom(&logs, &mut bloom);
 
             // For contract creation transactions, compute the contract address from sender + nonce.
             // This should be set even if the transaction reverted, matching geth's behavior.
             let sender = *transaction.pending_transaction.sender();
             let contract_address = if transaction.pending_transaction.transaction.to().is_none() {
-                let addr = sender.create(tx.nonce);
+                let addr = sender.create(nonce);
                 trace!(target: "backend", "Contract creation tx: computed address {:?}", addr);
                 Some(addr)
             } else {
@@ -234,8 +258,10 @@ impl<DB: Db + ?Sized, V: TransactionValidator> TransactionExecutor<'_, DB, V> {
                 traces,
                 exit,
                 out: out.map(Output::into_data),
-                nonce: tx.nonce,
-                gas_used: tx.gas_used,
+                nonce,
+                gas_used,
+                eip8141_payer,
+                eip8141_frame_statuses,
             };
 
             transaction_infos.push(info);
@@ -393,9 +419,12 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
 
         // Check if this is an EIP-8141 frame transaction — requires separate EVM with
         // FrameTxContext as chain parameter and EIP-8141 opcodes.
-        let is_eip8141 =
-            matches!(transaction.pending_transaction.transaction.as_ref(), FoundryTxEnvelope::Eip8141(_));
+        let is_eip8141 = matches!(
+            transaction.pending_transaction.transaction.as_ref(),
+            FoundryTxEnvelope::Eip8141(_)
+        );
 
+        let mut eip8141_meta = None;
         let exec_result = if is_eip8141 {
             // Decode the TxEip8141 from the sealed envelope.
             let frame_tx = match transaction.pending_transaction.transaction.as_ref() {
@@ -405,9 +434,10 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
 
             trace!(target: "backend", "[{:?}] executing EIP-8141 frame tx", transaction.hash());
             match execute_eip8141_frame_tx(&mut *self.db, &env, &frame_tx) {
-                Ok(exec_result) => {
+                Ok(exec_outcome) => {
+                    eip8141_meta = Some(exec_outcome.meta);
                     // Map HaltReason → OpHaltReason to match EitherEvm's return type.
-                    exec_result.map_haltreason(op_revm::OpHaltReason::Base)
+                    exec_outcome.result.map_haltreason(op_revm::OpHaltReason::Base)
                 }
                 Err(err) => {
                     warn!(target: "backend", "[{:?}] failed to execute EIP-8141 tx: {:?}", transaction.hash(), err);
@@ -523,12 +553,13 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
             logs: logs.unwrap_or_default(),
             traces: inspector.tracer.map(|t| t.into_traces().into_nodes()).unwrap_or_default(),
             nonce,
+            eip8141_payer: eip8141_meta.as_ref().and_then(|m| m.payer),
+            eip8141_frame_statuses: eip8141_meta.map(|m| m.frame_statuses),
         };
 
         Some(TransactionExecutionOutcome::Executed(tx))
     }
 }
-
 
 /// Inserts all logs into the bloom
 fn build_logs_bloom(logs: &[Log], bloom: &mut Bloom) {
