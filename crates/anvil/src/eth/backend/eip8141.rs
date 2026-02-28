@@ -18,9 +18,10 @@
 //!    - Once approved, DEFAULT/SENDER frames execute with the appropriate caller.
 //! 5. Refund unused gas to the sender after all frames complete.
 //!
-//! We use `system_call_with_caller_commit` for each frame because it bypasses
-//! standard transaction validation (nonce, gas limit) — we handle those ourselves
-//! at the frame-transaction level.
+//! We use `Handler::execution()` directly for each frame — it runs the frame
+//! and returns `FrameResult` WITHOUT calling `commit_tx()` or `finalize()`.
+//! This preserves journal entries so checkpoint/revert works correctly,
+//! and we control when to commit via a single `finalize()` + `commit()` at the end.
 
 use super::env::Env;
 use alloy_primitives::{Bytes, Log, U256};
@@ -29,15 +30,20 @@ use foundry_primitives::{
     FrameMode, TxEip8141, ENTRY_POINT, FRAME_TX_INTRINSIC_COST,
 };
 use revm::{
-    Database, DatabaseCommit, SystemCallCommitEvm,
+    Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm,
     context::{Evm as RevmEvm, Journal, TxEnv},
     context_interface::{
         JournalTr as _,
+        LocalContextTr as _,
         journaled_state::account::JournaledAccountTr as _,
         result::{EVMError, ExecutionResult, Output, SuccessReason},
     },
-    handler::instructions::EthInstructions,
+    handler::{
+        Handler as _, MainnetHandler,
+        instructions::EthInstructions,
+    },
     interpreter::{instructions::frame_tx::FrameTxContext, interpreter::EthInterpreter},
+    interpreter::InitialAndFloorGas,
     precompile::{PrecompileSpecId, Precompiles},
 };
 use alloy_evm::precompiles::PrecompilesMap;
@@ -188,34 +194,33 @@ where
     }
 
     // ── Frame execution ──────────────────────────────────────────────────
+    // Take an accounting checkpoint so we can revert all frame state on failure
+    // while preserving nonce + balance changes made above.
+    let accounting_checkpoint = evm.ctx.journaled_state.checkpoint();
+
+    let mut failure: Option<Bytes> = None;
     let mut all_logs: Vec<Log> = Vec::new();
     let mut total_gas_used: u64 = FRAME_TX_INTRINSIC_COST;
     let mut sender_approved = false;
 
-    for (i, frame_info) in frame_ctx.frames.iter().enumerate() {
+    'frames: for (i, frame_info) in frame_ctx.frames.iter().enumerate() {
         let mode = FrameMode::from_u8(frame_info.mode);
 
         // Update current frame index in the context.
         evm.ctx.chain.current_frame_index = i;
 
         // Pre-frame checks: SENDER and DEFAULT frames require prior approval.
-        // This implements the approval state machine:
-        //   VERIFY frames → set sender_approved → SENDER/DEFAULT frames can execute.
         match mode {
             Some(FrameMode::Default) | Some(FrameMode::Sender) => {
                 if !sender_approved {
-                    return Ok(ExecutionResult::Revert {
-                        gas_used: total_gas_used,
-                        output: Bytes::from_static(b"EIP-8141: sender not approved"),
-                    });
+                    failure = Some(Bytes::from_static(b"EIP-8141: sender not approved"));
+                    break 'frames;
                 }
             }
             Some(FrameMode::Verify) => {}
             None => {
-                return Ok(ExecutionResult::Revert {
-                    gas_used: total_gas_used,
-                    output: Bytes::from_static(b"EIP-8141: invalid frame mode"),
-                });
+                failure = Some(Bytes::from_static(b"EIP-8141: invalid frame mode"));
+                break 'frames;
             }
         }
 
@@ -225,87 +230,109 @@ where
             FrameMode::Sender => frame_tx.sender,
         };
 
-        // Set per-frame gas limit so the EVM enforces it.
-        evm.ctx.tx.gas_limit = frame_info.gas_limit;
-
-        // Execute frame. VERIFY frames use checkpoint/revert to be read-only (P1#4).
         let is_verify = mode == Some(FrameMode::Verify);
-        let checkpoint = if is_verify {
+
+        // For VERIFY: take a checkpoint so we can revert state changes.
+        let verify_cp = if is_verify {
             Some(evm.ctx.journaled_state.checkpoint())
         } else {
             None
         };
 
-        let result = evm.system_call_with_caller_commit(
-            caller,
-            frame_info.target,
-            frame_info.data.clone(),
-        );
+        // Set TxEnv for this frame.
+        evm.ctx.tx = TxEnv::builder()
+            .caller(caller)
+            .data(frame_info.data.clone())
+            .call(frame_info.target)
+            .gas_limit(frame_info.gas_limit)
+            .build_fill();
 
-        // For VERIFY: read approval flag before reverting journal state.
-        // FrameTxContext lives in chain ctx, not the journal, so it survives revert.
-        if let Some(cp) = checkpoint {
-            let approved_after = evm.ctx.chain.sender_approved;
-            evm.ctx.journaled_state.checkpoint_revert(cp);
-            evm.ctx.chain.sender_approved = approved_after;
+        // Execute — returns FrameResult, journal untouched.
+        // Do NOT use ? — must clean up on Err before propagating.
+        let init_gas = InitialAndFloorGas::new(0, 0);
+        let frame_result = match MainnetHandler::default().execution(&mut evm, &init_gas) {
+            Ok(r) => r,
+            Err(e) => {
+                evm.ctx.local.clear();
+                evm.frame_stack.clear();
+                evm.ctx.journaled_state.discard_tx();
+                return Err(e);
+            }
+        };
+
+        // Check context error (accumulated during execution).
+        let ctx_error = core::mem::replace(&mut evm.ctx.error, Ok(()));
+        if let Err(e) = ctx_error {
+            evm.ctx.local.clear();
+            evm.frame_stack.clear();
+            evm.ctx.journaled_state.discard_tx();
+            return Err(EVMError::from(e));
         }
 
-        match result {
-            Ok(exec_result) => {
-                let success = exec_result.is_success();
-                let gas_used = exec_result.gas_used();
+        // Extract gas info from FrameResult.
+        // used() = spent() - min(refunded, spent/5) to honor EVM-level gas refunds.
+        let gas_used = frame_result.gas().used();
+        let success = frame_result.instruction_result().is_ok();
 
-                // Per-frame gas limit enforcement (P0#2).
-                if gas_used > frame_info.gas_limit {
-                    total_gas_used = total_gas_used.saturating_add(gas_used);
-                    return Ok(ExecutionResult::Revert {
-                        gas_used: total_gas_used,
-                        output: Bytes::from_static(
-                            b"EIP-8141: frame exceeded gas limit",
-                        ),
-                    });
-                }
+        // Always add gas_used BEFORE any break (ensures failure path charges correctly).
+        total_gas_used = total_gas_used.saturating_add(gas_used);
 
-                total_gas_used = total_gas_used.saturating_add(gas_used);
-                all_logs.extend(exec_result.into_logs());
+        // Update frame status in chain context.
+        evm.ctx.chain.frames[i].status = Some(success);
 
-                // Update frame status in chain context (P1#5).
-                evm.ctx.chain.frames[i].status = Some(success);
+        // Clean up execution state for next frame (but NOT commit_tx!).
+        evm.ctx.local.clear();
+        evm.frame_stack.clear();
 
-                // Check VERIFY frame results (P0#3).
-                if is_verify {
-                    if !success {
-                        return Ok(ExecutionResult::Revert {
-                            gas_used: total_gas_used,
-                            output: Bytes::from_static(
-                                b"EIP-8141: VERIFY frame reverted",
-                            ),
-                        });
-                    }
-                    // Read back approval state from the chain context.
-                    sender_approved = evm.ctx.chain.sender_approved;
-                    if !sender_approved {
-                        return Ok(ExecutionResult::Revert {
-                            gas_used: total_gas_used,
-                            output: Bytes::from_static(
-                                b"EIP-8141: VERIFY frame did not call APPROVE",
-                            ),
-                        });
-                    }
-                }
+        if is_verify {
+            // Save ALL mutable chain ctx fields BEFORE revert.
+            let saved_sender_approved = evm.ctx.chain.sender_approved;
+            let saved_payer_approved = evm.ctx.chain.payer_approved;
+            let saved_payer = evm.ctx.chain.payer;
+            let saved_frame_status = evm.ctx.chain.frames[i].status;
+
+            // Revert VERIFY state changes — logs truncated too (JournalCheckpoint.log_i).
+            evm.ctx.journaled_state.checkpoint_revert(verify_cp.unwrap());
+
+            // Restore chain ctx fields (not part of journal).
+            evm.ctx.chain.sender_approved = saved_sender_approved;
+            evm.ctx.chain.payer_approved = saved_payer_approved;
+            evm.ctx.chain.payer = saved_payer;
+            evm.ctx.chain.frames[i].status = saved_frame_status;
+
+            // Do NOT collect logs (reverted by checkpoint_revert — log_i truncation).
+            if !success {
+                failure = Some(Bytes::from_static(b"EIP-8141: VERIFY frame reverted"));
+                break 'frames;
             }
-            Err(e) => {
-                return Ok(ExecutionResult::Revert {
-                    gas_used: total_gas_used,
-                    output: Bytes::from(
-                        format!("EIP-8141: frame {i} execution failed: {e:?}").into_bytes(),
-                    ),
-                });
+            sender_approved = evm.ctx.chain.sender_approved;
+            if !sender_approved {
+                failure = Some(Bytes::from_static(
+                    b"EIP-8141: VERIFY frame did not call APPROVE",
+                ));
+                break 'frames;
             }
+        } else {
+            // DEFAULT/SENDER — state stays in journal.
+            if !success {
+                failure = Some(Bytes::from_static(b"EIP-8141: frame execution failed"));
+                break 'frames;
+            }
+            // Collect logs (take_logs drains journal logs accumulated during this frame).
+            all_logs.extend(evm.ctx.journaled_state.take_logs());
         }
     }
 
-    // Refund unused gas to the sender (P0#1).
+    // ── Single exit block ────────────────────────────────────────────────
+    if failure.is_some() {
+        // Revert all frame state changes (preserves nonce + balance before checkpoint).
+        evm.ctx.journaled_state.checkpoint_revert(accounting_checkpoint);
+        all_logs.clear();
+    } else {
+        evm.ctx.journaled_state.checkpoint_commit();
+    }
+
+    // Gas refund — SAME formula for success and failure.
     let effective_gas_price = {
         let base_fee = evm.ctx.block.basefee as u128;
         let tip = (frame_tx.max_fee_per_gas.saturating_sub(base_fee))
@@ -323,11 +350,21 @@ where
         sender_acc.incr_balance(refund);
     }
 
-    Ok(ExecutionResult::Success {
-        reason: SuccessReason::Return,
-        gas_used: total_gas_used,
-        gas_refunded: 0,
-        logs: all_logs,
-        output: Output::Call(Bytes::new()),
-    })
+    // Single atomic commit to DB.
+    let state = evm.finalize();
+    evm.commit(state);
+
+    match failure {
+        Some(output) => Ok(ExecutionResult::Revert {
+            gas_used: total_gas_used,
+            output,
+        }),
+        None => Ok(ExecutionResult::Success {
+            reason: SuccessReason::Return,
+            gas_used: total_gas_used,
+            gas_refunded: 0,
+            logs: all_logs,
+            output: Output::Call(Bytes::new()),
+        }),
+    }
 }
