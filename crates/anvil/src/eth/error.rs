@@ -105,6 +105,10 @@ pub enum BlockchainError {
     )]
     EIP7702TransactionUnsupportedAtHardfork,
     #[error(
+        "EIP-8141 frame transaction received but is not supported by the current hardfork.\n\nYou can use it by running anvil with '--hardfork cancun' or later."
+    )]
+    EIP8141TransactionUnsupportedAtHardfork,
+    #[error(
         "op-stack deposit tx received but is not supported.\n\nYou can use it by running anvil with '--optimism'."
     )]
     DepositTransactionUnsupported,
@@ -564,6 +568,9 @@ impl<T: Serialize> ToRpcResponseResult for Result<T> {
                     RpcError::invalid_params(err.to_string())
                 }
                 err @ BlockchainError::EIP7702TransactionUnsupportedAtHardfork => {
+                    RpcError::invalid_params(err.to_string())
+                }
+                err @ BlockchainError::EIP8141TransactionUnsupportedAtHardfork => {
                     RpcError::invalid_params(err.to_string())
                 }
                 err @ BlockchainError::DepositTransactionUnsupported => {

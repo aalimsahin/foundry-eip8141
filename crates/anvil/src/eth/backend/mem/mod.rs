@@ -838,6 +838,19 @@ impl Backend {
         Err(BlockchainError::EIP7702TransactionUnsupportedAtHardfork)
     }
 
+    /// Returns true for post Cancun (EIP-8141 requires at minimum Cancun for blob fields).
+    pub fn is_eip8141(&self) -> bool {
+        (self.spec_id() as u8) >= (SpecId::CANCUN as u8)
+    }
+
+    /// Returns an error if EIP-8141 is not active (pre Cancun)
+    pub fn ensure_eip8141_active(&self) -> Result<(), BlockchainError> {
+        if self.is_eip8141() {
+            return Ok(());
+        }
+        Err(BlockchainError::EIP8141TransactionUnsupportedAtHardfork)
+    }
+
     /// Returns an error if op-stack deposits are not active
     pub fn ensure_op_deposits_active(&self) -> Result<(), BlockchainError> {
         if self.is_optimism() {

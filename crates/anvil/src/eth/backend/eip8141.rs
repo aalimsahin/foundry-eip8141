@@ -200,8 +200,10 @@ where
 
     let mut failure: Option<Bytes> = None;
     let mut all_logs: Vec<Log> = Vec::new();
-    let mut total_gas_used: u64 = FRAME_TX_INTRINSIC_COST;
-    let mut total_gas_spent: u64 = FRAME_TX_INTRINSIC_COST;
+    // Include calldata cost in base gas (matches total_gas_limit() accounting).
+    let calldata_gas = frame_tx.frames_calldata_cost();
+    let mut total_gas_used: u64 = FRAME_TX_INTRINSIC_COST.saturating_add(calldata_gas);
+    let mut total_gas_spent: u64 = FRAME_TX_INTRINSIC_COST.saturating_add(calldata_gas);
     let mut sender_approved = false;
     let has_sender_frames =
         frame_ctx.frames.iter().any(|frame| frame.mode == FrameMode::Sender as u8);
@@ -229,9 +231,10 @@ where
         }
 
         // Determine caller based on frame mode.
-        let caller = match mode.unwrap() {
-            FrameMode::Verify | FrameMode::Default => ENTRY_POINT,
-            FrameMode::Sender => frame_tx.sender,
+        let caller = match mode {
+            Some(FrameMode::Verify) | Some(FrameMode::Default) => ENTRY_POINT,
+            Some(FrameMode::Sender) => frame_tx.sender,
+            None => unreachable!("invalid mode filtered at line 226"),
         };
 
         let is_verify = mode == Some(FrameMode::Verify);
@@ -240,6 +243,11 @@ where
         if is_verify {
             evm.ctx.chain.approve_called_current_frame = false;
         }
+
+        // Snapshot approval state BEFORE VERIFY execution.
+        let pre_sender_approved = if is_verify { evm.ctx.chain.sender_approved } else { false };
+        let pre_payer_approved = if is_verify { evm.ctx.chain.payer_approved } else { false };
+        let pre_payer = if is_verify { evm.ctx.chain.payer } else { Address::ZERO };
 
         // For VERIFY: take a checkpoint so we can revert state changes.
         let verify_cp = if is_verify { Some(evm.ctx.journaled_state.checkpoint()) } else { None };
@@ -292,22 +300,31 @@ where
         evm.frame_stack.clear();
 
         if is_verify {
-            // Save ALL mutable chain ctx fields BEFORE revert.
-            let saved_sender_approved = evm.ctx.chain.sender_approved;
-            let saved_payer_approved = evm.ctx.chain.payer_approved;
-            let saved_payer = evm.ctx.chain.payer;
-            let saved_frame_status = evm.ctx.chain.frames[i].status;
-            let saved_approve_called = evm.ctx.chain.approve_called_current_frame;
+            // Capture post-exec values (APPROVE may have mutated these).
+            let post_sender_approved = evm.ctx.chain.sender_approved;
+            let post_payer_approved = evm.ctx.chain.payer_approved;
+            let post_payer = evm.ctx.chain.payer;
+            let post_frame_status = evm.ctx.chain.frames[i].status;
+            let post_approve_called = evm.ctx.chain.approve_called_current_frame;
 
-            // Revert VERIFY state changes — logs truncated too (JournalCheckpoint.log_i).
+            // Revert journaled VERIFY state changes (storage, balance).
             evm.ctx.journaled_state.checkpoint_revert(verify_cp.unwrap());
 
-            // Restore chain ctx fields (not part of journal).
-            evm.ctx.chain.sender_approved = saved_sender_approved;
-            evm.ctx.chain.payer_approved = saved_payer_approved;
-            evm.ctx.chain.payer = saved_payer;
-            evm.ctx.chain.frames[i].status = saved_frame_status;
-            evm.ctx.chain.approve_called_current_frame = saved_approve_called;
+            if success {
+                // SUCCESS: keep APPROVE effects (post-exec approval state).
+                evm.ctx.chain.sender_approved = post_sender_approved;
+                evm.ctx.chain.payer_approved = post_payer_approved;
+                evm.ctx.chain.payer = post_payer;
+                evm.ctx.chain.frames[i].status = post_frame_status;
+                evm.ctx.chain.approve_called_current_frame = post_approve_called;
+            } else {
+                // FAILURE: discard APPROVE effects — restore pre-frame state.
+                evm.ctx.chain.sender_approved = pre_sender_approved;
+                evm.ctx.chain.payer_approved = pre_payer_approved;
+                evm.ctx.chain.payer = pre_payer;
+                evm.ctx.chain.frames[i].status = Some(false);
+                evm.ctx.chain.approve_called_current_frame = false;
+            }
 
             // Do NOT collect logs (reverted by checkpoint_revert — log_i truncation).
             if !success {

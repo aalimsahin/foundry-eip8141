@@ -345,6 +345,12 @@ impl TxEip8141 {
             return Err(Eip8141ValidationError::MaxFeeBelowPriority);
         }
 
+        // At least one VERIFY frame is required (payer approval can only happen in VERIFY).
+        let has_verify = self.frames.iter().any(|f| f.mode == FrameMode::Verify);
+        if !has_verify {
+            return Err(Eip8141ValidationError::NoVerifyFrame);
+        }
+
         Ok(())
     }
 
@@ -385,6 +391,8 @@ pub enum Eip8141ValidationError {
     GasLimitOverflow,
     /// `max_fee_per_gas` is less than `max_priority_fee_per_gas`.
     MaxFeeBelowPriority,
+    /// Transaction has no VERIFY frame (payer approval requires at least one).
+    NoVerifyFrame,
 }
 
 impl core::fmt::Display for Eip8141ValidationError {
@@ -400,6 +408,9 @@ impl core::fmt::Display for Eip8141ValidationError {
             Self::GasLimitOverflow => write!(f, "EIP-8141: gas limit sum overflows u64"),
             Self::MaxFeeBelowPriority => {
                 write!(f, "EIP-8141: max_fee_per_gas < max_priority_fee_per_gas")
+            }
+            Self::NoVerifyFrame => {
+                write!(f, "EIP-8141: at least one VERIFY frame is required")
             }
         }
     }
@@ -458,6 +469,9 @@ impl Decodable for TxEip8141 {
         if !frames_header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
+        if frames_header.payload_length > buf.len() {
+            return Err(alloy_rlp::Error::InputTooShort);
+        }
         let mut frames = Vec::new();
         let frames_end = buf.len() - frames_header.payload_length;
         while buf.len() > frames_end {
@@ -472,6 +486,9 @@ impl Decodable for TxEip8141 {
         let blob_header = alloy_rlp::Header::decode(buf)?;
         if !blob_header.list {
             return Err(alloy_rlp::Error::UnexpectedString);
+        }
+        if blob_header.payload_length > buf.len() {
+            return Err(alloy_rlp::Error::InputTooShort);
         }
         let mut blob_versioned_hashes = Vec::new();
         let blob_end = buf.len() - blob_header.payload_length;
@@ -794,6 +811,27 @@ mod tests {
     fn test_validate_valid_tx() {
         let tx = sample_tx();
         assert!(tx.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_verify_frame() {
+        let mut tx = sample_tx();
+        // Replace all frames with only DEFAULT/SENDER (no VERIFY)
+        tx.frames = vec![
+            Frame {
+                mode: FrameMode::Default,
+                target: Some(Address::ZERO),
+                gas_limit: 100_000,
+                data: Bytes::new(),
+            },
+            Frame {
+                mode: FrameMode::Sender,
+                target: Some(Address::ZERO),
+                gas_limit: 100_000,
+                data: Bytes::new(),
+            },
+        ];
+        assert_eq!(tx.validate(), Err(Eip8141ValidationError::NoVerifyFrame));
     }
 
     // ─── Additional Unit Tests ─────────────────────────────────────────────

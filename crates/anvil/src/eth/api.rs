@@ -3458,8 +3458,8 @@ impl EthApi {
             FoundryTxEnvelope::Legacy(_) => Ok(()),
             // TODO(onbjerg): we should impl support for Tempo transactions
             FoundryTxEnvelope::Tempo(_) => todo!(),
-            // EIP-8141 frame transactions are always accepted
-            FoundryTxEnvelope::Eip8141(_) => Ok(()),
+            // EIP-8141 requires at minimum Cancun (for blob fields) + explicit support.
+            FoundryTxEnvelope::Eip8141(_) => self.backend.ensure_eip8141_active(),
         }
     }
 }

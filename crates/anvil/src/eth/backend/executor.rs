@@ -426,6 +426,17 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
 
         let mut eip8141_meta = None;
         let exec_result = if is_eip8141 {
+            // Defense-in-depth: reject EIP-8141 txs on pre-Cancun specs even if they
+            // bypassed the API admission gate (e.g. direct pool insertion).
+            if !self.evm_env.cfg_env().spec.is_enabled_in(SpecId::CANCUN) {
+                return Some(TransactionExecutionOutcome::Invalid(
+                    transaction,
+                    InvalidTransactionError::Custom(
+                        "EIP-8141 frame transactions require Cancun or later".into(),
+                    ),
+                ));
+            }
+
             // Decode the TxEip8141 from the sealed envelope.
             let frame_tx = match transaction.pending_transaction.transaction.as_ref() {
                 FoundryTxEnvelope::Eip8141(sealed) => sealed.inner().clone(),

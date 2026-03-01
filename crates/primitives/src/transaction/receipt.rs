@@ -41,6 +41,17 @@ pub enum FoundryReceiptEnvelope<T = Log> {
 pub type Eip8141ReceiptWithBloom<T = Log> = ReceiptWithBloom<Eip8141Receipt<T>>;
 
 /// EIP-8141 receipt payload extension.
+///
+/// ## RLP Wire Format (v2, current)
+///
+/// The `payer` field is always encoded:
+/// - `Some(addr)` → 21-byte RLP address
+/// - `None` → `0x80` (RLP empty string)
+///
+/// The decoder supports **both** v1 (payer omitted when None) and v2 (payer always present)
+/// for backward-compatible reads. However, v1 binaries cannot decode v2 receipts where
+/// `payer=None` (they will see an unexpected `0x80` byte). This is acceptable because
+/// EIP-8141 is pre-mainnet and no v1 receipts exist in production.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Eip8141Receipt<T = Log> {
@@ -172,15 +183,17 @@ impl<T: Encodable> Eip8141Receipt<T> {
     /// Returns length of RLP-encoded receipt fields with bloom, without list header.
     pub fn rlp_encoded_fields_length_with_bloom(&self, bloom: &Bloom) -> usize {
         self.inner.rlp_encoded_fields_length_with_bloom(bloom)
-            + self.payer.map_or(0, |payer| payer.length())
+            // Payer: always encoded — 21 bytes for Some(addr), 1 byte for None (0x80 empty string)
+            + self.payer.map_or(1, |payer| payer.length())
             + self.frame_receipts.length()
     }
 
     /// RLP-encodes receipt fields with bloom, without list header.
     pub fn rlp_encode_fields_with_bloom(&self, bloom: &Bloom, out: &mut dyn BufMut) {
         self.inner.rlp_encode_fields_with_bloom(bloom, out);
-        if let Some(payer) = self.payer {
-            payer.encode(out);
+        match self.payer {
+            Some(payer) => payer.encode(out),
+            None => Header { list: false, payload_length: 0 }.encode(out), // 0x80 = empty string
         }
         self.frame_receipts.encode(out);
     }
@@ -199,8 +212,18 @@ impl<T: Decodable> Eip8141Receipt<T> {
         let ReceiptWithBloom { receipt: inner, logs_bloom } =
             Receipt::rlp_decode_fields_with_bloom(buf)?;
 
-        let payer = if !buf.is_empty() && buf[0] < alloy_rlp::EMPTY_LIST_CODE {
-            Some(Address::decode(buf)?)
+        let payer = if !buf.is_empty() {
+            if buf[0] == 0x80 {
+                // New format: explicit empty string = None
+                let _ = Header::decode(buf)?; // consume the 0x80 byte
+                None
+            } else if buf[0] < alloy_rlp::EMPTY_LIST_CODE {
+                // Old format OR new format with address: decode 20-byte address
+                Some(Address::decode(buf)?)
+            } else {
+                // Next field is a list (frame_receipts) — old format, no payer
+                None
+            }
         } else {
             None
         };
@@ -1032,5 +1055,46 @@ mod tests {
         let encoded = alloy_rlp::encode(&original);
         let decoded = Eip8141FrameReceipts::decode(&mut &encoded[..]).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// ET3: Receipt payer encoding backward compatibility.
+    /// New format always encodes payer (0x80 for None). Old format omits it entirely.
+    /// Decoder must support both.
+    #[test]
+    fn eip8141_receipt_payer_encoding_compat() {
+        use alloy_network::eip2718::{Decodable2718, Encodable2718};
+
+        // New format roundtrip: payer=None (encoded as 0x80)
+        let receipt_none = FoundryReceiptEnvelope::Eip8141(Eip8141ReceiptWithBloom {
+            receipt: Eip8141Receipt {
+                inner: Receipt { status: true.into(), cumulative_gas_used: 21000, logs: vec![] },
+                payer: None,
+                frame_receipts: Eip8141FrameReceipts(vec![Some(true)]),
+            },
+            logs_bloom: [0; 256].into(),
+        });
+        let mut encoded = Vec::new();
+        receipt_none.encode_2718(&mut encoded);
+        let decoded = FoundryReceiptEnvelope::decode_2718(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.payer(), None);
+        assert_eq!(decoded.frame_receipts(), Some(&[Some(true)] as &[Option<bool>]));
+
+        // New format roundtrip: payer=Some(addr)
+        let addr = address!("0000000000000000000000000000000000000033");
+        let receipt_some = FoundryReceiptEnvelope::Eip8141(Eip8141ReceiptWithBloom {
+            receipt: Eip8141Receipt {
+                inner: Receipt { status: true.into(), cumulative_gas_used: 42000, logs: vec![] },
+                payer: Some(addr),
+                frame_receipts: Eip8141FrameReceipts(vec![Some(true), Some(false)]),
+            },
+            logs_bloom: [0; 256].into(),
+        });
+        let mut encoded = Vec::new();
+        receipt_some.encode_2718(&mut encoded);
+        let decoded = FoundryReceiptEnvelope::decode_2718(&mut &encoded[..]).unwrap();
+        assert_eq!(decoded.payer(), Some(addr));
+
+        // Old format: payer field omitted entirely (just inner receipt + frame_receipts list)
+        // The old format backward compat test already exists above.
     }
 }
