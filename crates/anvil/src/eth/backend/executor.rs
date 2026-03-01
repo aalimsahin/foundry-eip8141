@@ -433,7 +433,7 @@ impl<DB: Db + ?Sized, V: TransactionValidator> Iterator for &mut TransactionExec
             };
 
             trace!(target: "backend", "[{:?}] executing EIP-8141 frame tx", transaction.hash());
-            match execute_eip8141_frame_tx(&mut *self.db, &env, &frame_tx) {
+            match execute_eip8141_frame_tx(&mut *self.db, &env, &frame_tx, &mut inspector) {
                 Ok(exec_outcome) => {
                     eip8141_meta = Some(exec_outcome.meta);
                     // Map HaltReason → OpHaltReason to match EitherEvm's return type.

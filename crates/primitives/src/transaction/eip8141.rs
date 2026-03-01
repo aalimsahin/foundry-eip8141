@@ -67,10 +67,14 @@ impl FrameMode {
 // ─── Frame ──────────────────────────────────────────────────────────────────
 
 /// A single frame within an EIP-8141 frame transaction.
+///
+/// EIP-8141 intentionally omits per-frame `value` field. ETH transfers happen via
+/// SENDER frames calling contracts (e.g., CALL with value). This avoids double-charging
+/// semantics and keeps frame execution orthogonal to value transfer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Frame {
-    /// Execution mode (0=DEFAULT, 1=VERIFY, 2=SENDER).
-    pub mode: u8,
+    /// Execution mode.
+    pub mode: FrameMode,
     /// Optional target contract address. `None` means sender address.
     pub target: Option<Address>,
     /// Gas limit for this frame.
@@ -81,16 +85,17 @@ pub struct Frame {
 
 impl Encodable for Frame {
     fn encode(&self, out: &mut dyn BufMut) {
+        let mode_byte = self.mode as u8;
         let target_len = self.target.map_or_else(|| Bytes::new().length(), |t| t.length());
         alloy_rlp::Header {
             list: true,
-            payload_length: self.mode.length()
+            payload_length: mode_byte.length()
                 + target_len
                 + self.gas_limit.length()
                 + self.data.length(),
         }
         .encode(out);
-        self.mode.encode(out);
+        mode_byte.encode(out);
         if let Some(target) = self.target {
             target.encode(out);
         } else {
@@ -102,9 +107,10 @@ impl Encodable for Frame {
     }
 
     fn length(&self) -> usize {
+        let mode_byte = self.mode as u8;
         let target_len = self.target.map_or_else(|| Bytes::new().length(), |t| t.length());
         let payload_length =
-            self.mode.length() + target_len + self.gas_limit.length() + self.data.length();
+            mode_byte.length() + target_len + self.gas_limit.length() + self.data.length();
         payload_length + alloy_rlp::length_of_length(payload_length)
     }
 }
@@ -116,7 +122,10 @@ impl Decodable for Frame {
             return Err(alloy_rlp::Error::UnexpectedString);
         }
         let remaining_before = buf.len();
-        let mode = u8::decode(buf)?;
+        let mode_byte = u8::decode(buf)?;
+        let mode = FrameMode::from_u8(mode_byte).ok_or(
+            alloy_rlp::Error::Custom("EIP-8141: invalid frame mode"),
+        )?;
         let target_bytes = Bytes::decode(buf)?;
         let target = if target_bytes.is_empty() {
             None
@@ -205,17 +214,79 @@ impl TxEip8141 {
         let mut hasher = Keccak256::new();
         hasher.update([EIP8141_TX_TYPE_ID]);
 
-        let mut modified = self.clone();
-        for frame in &mut modified.frames {
-            if frame.mode == FrameMode::Verify as u8 {
-                frame.data = Bytes::default();
-            }
-        }
-
         let mut rlp_buf = Vec::new();
-        modified.encode(&mut rlp_buf);
+        self.encode_for_signing(&mut rlp_buf);
         hasher.update(&rlp_buf);
         hasher.finalize()
+    }
+
+    /// RLP-encode with VERIFY frame data replaced by empty bytes (for signature hash).
+    ///
+    /// Same structure as [`encode()`](Self::encode) but zeroes VERIFY data.
+    /// Avoids a full deep clone of the transaction.
+    fn encode_for_signing(&self, out: &mut dyn BufMut) {
+        // Compute payload length with zeroed VERIFY data.
+        let frames_payload: usize = self.frames.iter().map(|f| {
+            let mode_byte = f.mode as u8;
+            let target_len = f.target.map_or_else(|| Bytes::new().length(), |t| t.length());
+            let data_len = if f.mode == FrameMode::Verify {
+                Bytes::new().length()
+            } else {
+                f.data.length()
+            };
+            let inner = mode_byte.length() + target_len + f.gas_limit.length() + data_len;
+            inner + alloy_rlp::length_of_length(inner)
+        }).sum();
+        let frames_list_len = frames_payload + alloy_rlp::length_of_length(frames_payload);
+
+        let blob_payload: usize = self.blob_versioned_hashes.iter().map(|h| h.length()).sum();
+        let blob_list_len = blob_payload + alloy_rlp::length_of_length(blob_payload);
+
+        let payload_length = self.chain_id.length()
+            + self.nonce.length()
+            + self.sender.length()
+            + frames_list_len
+            + self.max_priority_fee_per_gas.length()
+            + self.max_fee_per_gas.length()
+            + self.max_fee_per_blob_gas.length()
+            + blob_list_len;
+
+        alloy_rlp::Header { list: true, payload_length }.encode(out);
+
+        self.chain_id.encode(out);
+        self.nonce.encode(out);
+        self.sender.encode(out);
+
+        // Encode frames with VERIFY data zeroed.
+        alloy_rlp::Header { list: true, payload_length: frames_payload }.encode(out);
+        for f in &self.frames {
+            let mode_byte = f.mode as u8;
+            let target_len = f.target.map_or_else(|| Bytes::new().length(), |t| t.length());
+            let data = if f.mode == FrameMode::Verify {
+                &Bytes::new()
+            } else {
+                &f.data
+            };
+            let inner = mode_byte.length() + target_len + f.gas_limit.length() + data.length();
+            alloy_rlp::Header { list: true, payload_length: inner }.encode(out);
+            mode_byte.encode(out);
+            if let Some(target) = f.target {
+                target.encode(out);
+            } else {
+                Bytes::new().encode(out);
+            }
+            f.gas_limit.encode(out);
+            data.encode(out);
+        }
+
+        self.max_priority_fee_per_gas.encode(out);
+        self.max_fee_per_gas.encode(out);
+        self.max_fee_per_blob_gas.encode(out);
+
+        alloy_rlp::Header { list: true, payload_length: blob_payload }.encode(out);
+        for hash in &self.blob_versioned_hashes {
+            hash.encode(out);
+        }
     }
 
     /// Computes the transaction hash (keccak256 of the full EIP-2718 encoding).
@@ -258,13 +329,8 @@ impl TxEip8141 {
 
         let mut gas_total: u64 = FRAME_TX_INTRINSIC_COST;
 
-        for (i, frame) in self.frames.iter().enumerate() {
-            if FrameMode::from_u8(frame.mode).is_none() {
-                return Err(Eip8141ValidationError::InvalidFrameMode {
-                    index: i,
-                    mode: frame.mode,
-                });
-            }
+        for (_i, frame) in self.frames.iter().enumerate() {
+            // Frame mode is validated at decode time (FrameMode type).
 
             gas_total = gas_total
                 .checked_add(frame.gas_limit)
@@ -487,7 +553,7 @@ impl Transaction for TxEip8141 {
 
     fn kind(&self) -> TxKind {
         for frame in &self.frames {
-            if frame.mode != FrameMode::Verify as u8 {
+            if frame.mode != FrameMode::Verify {
                 return TxKind::Call(frame.target.unwrap_or(self.sender));
             }
         }
@@ -501,7 +567,7 @@ impl Transaction for TxEip8141 {
     fn input(&self) -> &Bytes {
         static EMPTY: Bytes = Bytes::new();
         for frame in &self.frames {
-            if frame.mode != FrameMode::Verify as u8 {
+            if frame.mode != FrameMode::Verify {
                 return &frame.data;
             }
         }
@@ -588,13 +654,13 @@ mod tests {
             sender: Address::ZERO,
             frames: vec![
                 Frame {
-                    mode: FrameMode::Verify as u8,
+                    mode: FrameMode::Verify,
                     target: Some(Address::ZERO),
                     gas_limit: 100_000,
                     data: Bytes::from_static(&[0x01, 0x02, 0x03]),
                 },
                 Frame {
-                    mode: FrameMode::Sender as u8,
+                    mode: FrameMode::Sender,
                     target: Some(Address::ZERO),
                     gas_limit: 200_000,
                     data: Bytes::from_static(&[0xaa, 0xbb]),
@@ -664,7 +730,7 @@ mod tests {
         let mut tx = sample_tx();
         tx.frames = (0..MAX_FRAMES + 1)
             .map(|_| Frame {
-                mode: FrameMode::Default as u8,
+                mode: FrameMode::Default,
                 target: Some(Address::ZERO),
                 gas_limit: 1,
                 data: Bytes::new(),
@@ -677,13 +743,23 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_invalid_mode() {
-        let mut tx = sample_tx();
-        tx.frames[0].mode = 99;
-        assert_eq!(
-            tx.validate(),
-            Err(Eip8141ValidationError::InvalidFrameMode { index: 0, mode: 99 })
-        );
+    fn test_decode_rejects_invalid_mode() {
+        // Manually encode a frame with invalid mode byte (99) and verify decode fails.
+        let mut buf = Vec::new();
+        // Encode a frame-like RLP list: [mode=99, target=empty, gas_limit=100, data=empty]
+        let inner: Vec<u8> = {
+            let mut v = Vec::new();
+            99u8.encode(&mut v);
+            Bytes::new().encode(&mut v);
+            100u64.encode(&mut v);
+            Bytes::new().encode(&mut v);
+            v
+        };
+        alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut buf);
+        buf.extend_from_slice(&inner);
+
+        let result = Frame::decode(&mut buf.as_slice());
+        assert!(result.is_err(), "decoding frame with mode=99 should fail");
     }
 
     #[test]
@@ -698,7 +774,7 @@ mod tests {
     fn test_validate_verify_after_execution_allowed() {
         let mut tx = sample_tx();
         tx.frames.push(Frame {
-            mode: FrameMode::Verify as u8,
+            mode: FrameMode::Verify,
             target: Some(Address::ZERO),
             gas_limit: 100,
             data: Bytes::new(),
@@ -784,5 +860,60 @@ mod tests {
         assert_eq!(decoded.frames[0].target, None);
         assert_eq!(decoded.frames[1].target, None);
         assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn test_target_19_bytes_rejected() {
+        // Manually build a frame with 19-byte target and verify decode failure.
+        let mut buf = Vec::new();
+        let target_19 = Bytes::from(vec![0xAB; 19]);
+        let mode_byte: u8 = 0;
+        let gas: u64 = 100;
+        let data = Bytes::new();
+
+        let inner_len = mode_byte.length() + target_19.length() + gas.length() + data.length();
+        alloy_rlp::Header { list: true, payload_length: inner_len }.encode(&mut buf);
+        mode_byte.encode(&mut buf);
+        target_19.encode(&mut buf);
+        gas.encode(&mut buf);
+        data.encode(&mut buf);
+
+        let result = Frame::decode(&mut buf.as_slice());
+        assert!(result.is_err(), "19-byte target should be rejected");
+    }
+
+    #[test]
+    fn test_target_21_bytes_rejected() {
+        // Manually build a frame with 21-byte target and verify decode failure.
+        let mut buf = Vec::new();
+        let target_21 = Bytes::from(vec![0xAB; 21]);
+        let mode_byte: u8 = 0;
+        let gas: u64 = 100;
+        let data = Bytes::new();
+
+        let inner_len = mode_byte.length() + target_21.length() + gas.length() + data.length();
+        alloy_rlp::Header { list: true, payload_length: inner_len }.encode(&mut buf);
+        mode_byte.encode(&mut buf);
+        target_21.encode(&mut buf);
+        gas.encode(&mut buf);
+        data.encode(&mut buf);
+
+        let result = Frame::decode(&mut buf.as_slice());
+        assert!(result.is_err(), "21-byte target should be rejected");
+    }
+
+    #[test]
+    fn test_zero_address_is_some_not_none() {
+        let frame = Frame {
+            mode: FrameMode::Default,
+            target: Some(Address::ZERO),
+            gas_limit: 100,
+            data: Bytes::new(),
+        };
+        let mut buf = Vec::new();
+        frame.encode(&mut buf);
+        let decoded = Frame::decode(&mut buf.as_slice()).unwrap();
+        // Empty address (0x0000...0000) must be Some(Address::ZERO), NOT None.
+        assert_eq!(decoded.target, Some(Address::ZERO));
     }
 }
